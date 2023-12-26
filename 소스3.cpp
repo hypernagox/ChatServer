@@ -13,12 +13,12 @@ using namespace std;
 mutex g_mt;
 int curIdx = 0;
 //array<SOCKET,WSA_MAXIMUM_WAIT_EVENTS> arrSocket;
-//array<WSAEVENT, WSA_MAXIMUM_WAIT_EVENTS> arrEvents;
+array<WSAEVENT, WSA_MAXIMUM_WAIT_EVENTS> arrEvents;
 int g_clientID = 0;
 SOCKET hSocket;
 
 //소켓에 대한 이벤트 핸들의 배열
-WSAEVENT	arrEvents[WSA_MAXIMUM_WAIT_EVENTS];
+//WSAEVENT	arrEvents[WSA_MAXIMUM_WAIT_EVENTS];
 //소켓의 배열. 이벤트 핸들 배열과 쌍을 이룬다.
 SOCKET		arrSocket[WSA_MAXIMUM_WAIT_EVENTS];
 
@@ -186,13 +186,14 @@ int main()
 	{
 		dwIndex = ::WSAWaitForMultipleEvents(
 			curIdx + 1, // 감시 할 이벤트 갯수
-			arrEvents, // 이벤트 배열
+			arrEvents.data(), // 이벤트 배열
 			FALSE, // 전체 대기 X
 			100, // 100ms만대기해봄
 			FALSE // 스레드상태변경 X
 		);
 
-		if (dwIndex == WSA_WAIT_FAILED)
+		if (dwIndex == WSA_WAIT_FAILED
+			|| dwIndex >= WSA_MAXIMUM_WAIT_EVENTS)
 			continue;
 
 		//이벤트가 발생한 소켓의 인덱스 및 이벤트 발생 이유를 확인한다.
