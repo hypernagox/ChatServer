@@ -363,3 +363,4 @@ MigrationBackup/
 FodyWeavers.xsd
 UnityRelease/
 UnityDebug/
+*.txt
