@@ -14,11 +14,13 @@
 #include <string_view>
 #include <format>
 #include <tchar.h>
+#include <unordered_set>
 
 using std::list;
 using std::vector;
 using std::shared_ptr;
 using std::unordered_map;
+using std::unordered_set;
 
 static constexpr int MAX_CLIENTS = 5000;
 
@@ -28,17 +30,18 @@ class Session;
 class SessionMgr
 {
 private:
-	list<shared_ptr<Session>> m_listSession;
-	unordered_map<Session*, decltype(m_listSession.begin())> m_mapSessionIter;
+	vector<shared_ptr<Session>> m_vecSession;
+	unordered_map<DWORD, shared_ptr<Session>> m_mapSessionIter;
+	unordered_set<DWORD> m_setEmptyIndex;
 	std::shared_mutex m_rwLock;
 public:
 	SessionMgr();
 	
-	void AddClientSession(shared_ptr<Session> pSession);
+	void AddClientSession(shared_ptr<Session> pSession, int& ID);
 	
 	void RemoveSession(shared_ptr<Session> pSession);
 	
-	shared_ptr<Session> FindSession(Session* pSessionKey);
+	shared_ptr<Session> FindSession(const int clientID);
 	
 
 	void SendAllMessage(shared_ptr<Session> pSession);
@@ -56,12 +59,14 @@ struct OVERLAPPED_EX
 	int offset = 0;
 	char	buffer[4096]{};
 	enum OperationType { SEND, RECEIVE } operationType;
-	OVERLAPPED_EX(const int id)
+
+	void SetOverLapped(const int id)
 	{
 		const std::wstring strID = std::format(L"ID{}: ", id);
 		offset = (int)strID.size() * sizeof(wchar_t); 
 		::memcpy(buffer, strID.data(), offset); 
 	}
+
 	void ReadyToRecv()
 	{
 		::ZeroMemory((OVERLAPPED*)this, sizeof(OVERLAPPED));
@@ -107,11 +112,9 @@ private:
 	OVERLAPPED_EX m_stOverlappedRecv;
 	OVERLAPPED_EX m_stOverlappedSend;
 	int m_iClientID = 0;
+	bool m_bIsValid = true;
 public:
-	Session(const int _id)
-		:m_iClientID{_id}
-		,m_stOverlappedRecv{_id}
-		,m_stOverlappedSend{_id}
+	Session()
 	{
 	}
 
@@ -121,7 +124,18 @@ public:
 		::closesocket(m_hClientSocket);
 	}
 
-	bool OnAcceptClient(SOCKET hServerSocket,HANDLE iocpHandle)
+	void RegisterIOCP(HANDLE iocpHandle)
+	{
+		::CreateIoCompletionPort((HANDLE)m_hClientSocket, iocpHandle,
+			(ULONG_PTR)m_iClientID,
+			0);
+
+		const std::wstring temp = std::format(_T("ID{} 입장\n"), m_iClientID);
+		m_stOverlappedSend.ReadyToSend((int)temp.size() * sizeof(wchar_t), (char*)temp.data());
+		g_SessionMgr->SendAllMessage(this->shared_from_this());
+	}
+
+	bool OnAcceptClient(SOCKET hServerSocket)
 	{
 		SOCKADDR sockAddr;
 		int	nAddrSize = sizeof(SOCKADDR);
@@ -129,22 +143,7 @@ public:
 		m_hClientSocket = ::accept(hServerSocket,
 			&sockAddr, &nAddrSize);
 
-		if (INVALID_SOCKET != m_hClientSocket)
-		{
-			::CreateIoCompletionPort((HANDLE)m_hClientSocket, iocpHandle,
-				(ULONG_PTR)this,	
-				0);
-
-			const std::wstring temp = std::format(_T("ID{} 입장\n"), m_iClientID);
-			m_stOverlappedSend.ReadyToSend((int)temp.size() * sizeof(wchar_t), (char*)temp.data());
-			g_SessionMgr->SendAllMessage(this->shared_from_this());
-
-			return true;
-		}
-		else
-		{
-			return false;
-		}
+		return INVALID_SOCKET != m_hClientSocket;
 	}
 
 	bool OnRecive()
@@ -161,13 +160,22 @@ public:
 	void SetReadyToSend(const int len) {
 		m_stOverlappedSend.ReadyToSend(len + m_stOverlappedRecv.offset,m_stOverlappedRecv.buffer);
 	}
+	void SetSession(const int ID)
+	{
+		m_stOverlappedRecv.SetOverLapped(ID);
+		m_stOverlappedSend.SetOverLapped(ID);
+		m_iClientID = ID;
+	}
+	const int GetClientID() { return m_iClientID; }
+	void Disconnect() { m_bIsValid = false; }
+	bool IsValid() { return m_bIsValid; }
 };
 
 DWORD WINAPI ThreadComplete(LPVOID pParam);
 
 class IOCPServer
 {
-	static inline int g_cliendID = 0;
+	static inline int g_clientID = 0;
 private:
 	HANDLE m_IOCPHandle;
 	SOCKET m_hServerSockket = NULL;
@@ -236,11 +244,12 @@ public:
 	{
 		shared_ptr<Session> pSession = nullptr;
 		while (
-			(pSession = std::make_shared<Session>(g_cliendID++))->OnAcceptClient(m_hServerSockket,m_IOCPHandle)
+			(pSession = std::make_shared<Session>())->OnAcceptClient(m_hServerSockket)
 			)
 		{
 			auto tempPtr = pSession.get();
-			g_SessionMgr->AddClientSession(std::move(pSession));
+			g_SessionMgr->AddClientSession(std::move(pSession), g_clientID);
+			tempPtr->RegisterIOCP(m_IOCPHandle);
 			tempPtr->OnRecive();
 
 			std::cout << "클라입장" << std::endl;
@@ -263,7 +272,7 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 {
 	DWORD			dwTransferredSize = 0;
 	DWORD			dwFlag = 0;
-	Session* pSession = NULL;
+	int clientID = 0;
 	LPWSAOVERLAPPED	pWol = NULL;
 	BOOL			bResult;
 	puts("[IOCP 작업자 스레드 시작]");
@@ -272,17 +281,20 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 		bResult = ::GetQueuedCompletionStatus(
 			g_IOCPServer->GetIOCPHandle(),				//Dequeue할 IOCP 핸들.
 			&dwTransferredSize,		//수신한 데이터 크기.
-			(PULONG_PTR)&pSession,	//수신된 데이터가 저장된 메모리
+			(PULONG_PTR)&clientID,	//수신된 데이터가 저장된 메모리
 			&pWol,					//OVERLAPPED 구조체.
 			INFINITE);				//이벤트를 무한정 대기.
 
-		shared_ptr<Session> SessionPtr = g_SessionMgr->FindSession(pSession);
+		shared_ptr<Session> SessionPtr = g_SessionMgr->FindSession(clientID);
 		OVERLAPPED_EX* pOverEx = (OVERLAPPED_EX*)pWol;
 
 		if (SessionPtr && bResult == TRUE)
 		{
 			//정상적인 경우.
-			
+			if (!SessionPtr->IsValid())
+			{
+				continue;
+			}
 			/////////////////////////////////////////////////////////////
 			//1. 클라이언트가 소켓을 정상적으로 닫고 연결을 끊은 경우.
 			if (dwTransferredSize == 0)
@@ -327,7 +339,7 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 			//   서버가 먼저 연결을 종료한 경우.
 			else
 			{
-				if (pSession != NULL)
+				if (SessionPtr != NULL)
 				{
 					g_SessionMgr->RemoveSession(SessionPtr);
 					//delete pWol;
@@ -346,35 +358,47 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 SessionMgr::SessionMgr()
 {
 }
-void SessionMgr::AddClientSession(shared_ptr<Session> pSession)
+void SessionMgr::AddClientSession(shared_ptr<Session> pSession,int& ID)
 {
-	auto tempPtr = pSession.get();
 	{
 		std::unique_lock<std::shared_mutex> wLock{ m_rwLock };
-		auto iter = m_listSession.emplace(m_listSession.end(), std::move(pSession));
-		m_mapSessionIter.emplace(tempPtr, std::move(iter));
+		if (m_setEmptyIndex.empty())
+		{
+			pSession->SetSession(ID);
+			m_mapSessionIter.emplace(ID++, m_vecSession.emplace_back(std::move(pSession)));
+		}
+		else
+		{
+			const int emptyID = m_setEmptyIndex.extract(m_setEmptyIndex.begin()).value();
+			pSession->SetSession(emptyID);
+			m_vecSession[emptyID] = m_mapSessionIter[emptyID] = std::move(pSession);
+		}
 	}
 }
 void SessionMgr::RemoveSession(shared_ptr<Session> pSession)
 {
+	pSession->Disconnect();
 	{
 		std::unique_lock<std::shared_mutex> wLock{ m_rwLock };
-		m_listSession.erase(m_mapSessionIter.extract(pSession.get()).mapped());
+		m_setEmptyIndex.emplace(pSession->GetClientID());
 	}
 }
-shared_ptr<Session> SessionMgr::FindSession(Session* pSessionKey)
+shared_ptr<Session> SessionMgr::FindSession(const int clientID)
 {
 	std::shared_lock<std::shared_mutex> wLock{ m_rwLock };
-	return *m_mapSessionIter.find(pSessionKey)->second;
+	return m_mapSessionIter[clientID];
 }
 
 void SessionMgr::SendAllMessage(shared_ptr<Session> pSession)
 {
 	{
 		std::shared_lock<std::shared_mutex> wLock{ m_rwLock };
-		for (const auto& session : m_listSession)
+		for (const auto& session : m_vecSession)
 		{
-			pSession->OnSend(session);
+			if (pSession->IsValid())
+			{
+				pSession->OnSend(session);
+			}
 		}
 	}
 }
