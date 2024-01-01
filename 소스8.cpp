@@ -30,7 +30,7 @@ class Session;
 class SessionMgr
 {
 private:
-	vector<shared_ptr<Session>> m_vecSession;
+	vector<Session*> m_vecSession;
 	unordered_map<DWORD, shared_ptr<Session>> m_mapSessionIter;
 	unordered_set<DWORD> m_setEmptyIndex;
 	std::shared_mutex m_rwLock;
@@ -151,7 +151,7 @@ public:
 		return m_stOverlappedRecv.OnRecv(m_hClientSocket);
 	}
 
-	bool OnSend(shared_ptr<Session> other)
+	bool OnSend(Session* const other)
 	{
 		return m_stOverlappedSend.OnSend(other->GetClinetSocket());
 	}
@@ -360,18 +360,25 @@ SessionMgr::SessionMgr()
 }
 void SessionMgr::AddClientSession(shared_ptr<Session> pSession,int& ID)
 {
+	const auto tempPtr = pSession.get();
 	{
 		std::unique_lock<std::shared_mutex> wLock{ m_rwLock };
 		if (m_setEmptyIndex.empty())
 		{
-			pSession->SetSession(ID);
-			m_mapSessionIter.emplace(ID++, m_vecSession.emplace_back(std::move(pSession)));
+			m_vecSession.emplace_back(tempPtr);
+			m_mapSessionIter.emplace(ID++, std::move(pSession));
+			wLock.unlock();
+
+			tempPtr->SetSession(ID - 1);
 		}
 		else
 		{
 			const int emptyID = m_setEmptyIndex.extract(m_setEmptyIndex.begin()).value();
-			pSession->SetSession(emptyID);
-			m_vecSession[emptyID] = m_mapSessionIter[emptyID] = std::move(pSession);
+			m_vecSession[emptyID] = tempPtr;
+			m_mapSessionIter[emptyID].swap(pSession);
+			wLock.unlock();
+
+			tempPtr->SetSession(emptyID);
 		}
 	}
 }
@@ -379,7 +386,7 @@ void SessionMgr::RemoveSession(shared_ptr<Session> pSession)
 {
 	pSession->Disconnect();
 	{
-		std::unique_lock<std::shared_mutex> wLock{ m_rwLock };
+		std::shared_lock<std::shared_mutex> rLock{ m_rwLock };
 		m_setEmptyIndex.emplace(pSession->GetClientID());
 	}
 }
