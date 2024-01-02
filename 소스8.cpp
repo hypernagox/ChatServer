@@ -15,6 +15,8 @@
 #include <format>
 #include <tchar.h>
 #include <unordered_set>
+#include <functional>
+#include "ConcurrentVector.hpp"
 
 using std::list;
 using std::vector;
@@ -30,14 +32,21 @@ class Session;
 class SessionMgr
 {
 private:
-	vector<Session*> m_vecSession;
+	ConcurrentVector<Session*> m_vecSession;
+	vector <std::pair<int, shared_ptr<Session>>> m_vecGarbage;
 	unordered_map<DWORD, shared_ptr<Session>> m_mapSessionIter;
 	unordered_set<DWORD> m_setEmptyIndex;
-	std::shared_mutex m_rwLock;
+	std::mutex m_setLock;
+	std::mutex m_mapLock;
+	std::shared_mutex m_garbageLock;
+	std::atomic_uint m_loopThreadCounter = 0;
+	std::function<bool(Session*, Session*)> m_lookUp[2];
+	Session* const m_dummyPtr;
 public:
 	SessionMgr();
-	
-	void AddClientSession(shared_ptr<Session> pSession, int& ID);
+	~SessionMgr();
+
+	void AddClientSession(shared_ptr<Session> pSession, int& ID, HANDLE iocpHandle);
 	
 	void RemoveSession(shared_ptr<Session> pSession);
 	
@@ -156,6 +165,11 @@ public:
 		return m_stOverlappedSend.OnSend(other->GetClinetSocket());
 	}
 
+	bool Nothing(Session* const other)
+	{
+		return false;
+	}
+
 	SOCKET GetClinetSocket() { return m_hClientSocket; }
 	void SetReadyToSend(const int len) {
 		m_stOverlappedSend.ReadyToSend(len + m_stOverlappedRecv.offset,m_stOverlappedRecv.buffer);
@@ -248,8 +262,7 @@ public:
 			)
 		{
 			auto tempPtr = pSession.get();
-			g_SessionMgr->AddClientSession(std::move(pSession), g_clientID);
-			tempPtr->RegisterIOCP(m_IOCPHandle);
+			g_SessionMgr->AddClientSession(std::move(pSession), g_clientID, m_IOCPHandle);
 			tempPtr->OnRecive();
 
 			std::cout << "클라입장" << std::endl;
@@ -356,56 +369,92 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 }
 
 SessionMgr::SessionMgr()
+	:m_dummyPtr{new Session}
 {
+	m_lookUp[0] = std::mem_fn(&Session::Nothing);
+	m_lookUp[1]	= std::mem_fn(&Session::OnSend);
+	m_vecSession.reserve(MAX_CLIENTS + 1);
+	m_mapSessionIter.reserve(MAX_CLIENTS + 1);
+	m_setEmptyIndex.reserve(MAX_CLIENTS + 1);
+	m_dummyPtr->Disconnect();
 }
-void SessionMgr::AddClientSession(shared_ptr<Session> pSession,int& ID)
+
+SessionMgr::~SessionMgr()
+{
+	delete m_dummyPtr;
+}
+
+void SessionMgr::AddClientSession(shared_ptr<Session> pSession,int& ID,HANDLE iocpHandle)
 {
 	const auto tempPtr = pSession.get();
+	int id = -1;
+	bool bEmpty = false;
 	{
-		std::unique_lock<std::shared_mutex> wLock{ m_rwLock };
-		if (m_setEmptyIndex.empty())
+		std::lock_guard<std::mutex>lock{ m_setLock };
+		bEmpty = m_setEmptyIndex.empty();
+		if (bEmpty)
 		{
-			m_vecSession.emplace_back(tempPtr);
-			m_mapSessionIter.emplace(ID++, std::move(pSession));
-			wLock.unlock();
-
-			tempPtr->SetSession(ID - 1);
+			id = ID++;
 		}
 		else
 		{
-			const int emptyID = m_setEmptyIndex.extract(m_setEmptyIndex.begin()).value();
-			m_vecSession[emptyID] = tempPtr;
-			m_mapSessionIter[emptyID].swap(pSession);
-			wLock.unlock();
-
-			tempPtr->SetSession(emptyID);
+			id = m_setEmptyIndex.extract(m_setEmptyIndex.begin()).value();
 		}
+	}
+	{
+		std::lock_guard<std::mutex> lock{ m_mapLock };
+		m_mapSessionIter[id].swap(pSession);
+	}
+	tempPtr->SetSession(id);
+	tempPtr->RegisterIOCP(iocpHandle);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (bEmpty)
+	{
+		m_vecSession.emplace_back(tempPtr);
+	}
+	else
+	{
+		m_vecSession[id] = tempPtr;
 	}
 }
 void SessionMgr::RemoveSession(shared_ptr<Session> pSession)
 {
 	pSession->Disconnect();
+	const int id = pSession->GetClientID();
+	m_vecSession[id] = m_dummyPtr;
 	{
-		std::shared_lock<std::shared_mutex> rLock{ m_rwLock };
-		m_setEmptyIndex.emplace(pSession->GetClientID());
+		std::shared_lock<std::shared_mutex> rLock{ m_garbageLock };
+		m_vecGarbage.emplace_back(id, std::move(pSession));
+	}
+	{
+		std::lock_guard<std::mutex> lock{ m_setLock };
+		m_setEmptyIndex.emplace(id);
 	}
 }
 shared_ptr<Session> SessionMgr::FindSession(const int clientID)
 {
-	std::shared_lock<std::shared_mutex> wLock{ m_rwLock };
+	std::lock_guard<std::mutex> lock{ m_mapLock };
 	return m_mapSessionIter[clientID];
 }
 
 void SessionMgr::SendAllMessage(shared_ptr<Session> pSession)
 {
+	++m_loopThreadCounter;
 	{
-		std::shared_lock<std::shared_mutex> wLock{ m_rwLock };
+		std::shared_lock<std::shared_mutex> rLock{ m_garbageLock };
 		for (const auto& session : m_vecSession)
 		{
-			if (pSession->IsValid())
-			{
-				pSession->OnSend(session);
-			}
+			const bool idx = pSession->IsValid() && session->IsValid();
+			m_lookUp[idx](pSession.get(), session);
 		}
+	}
+	if (0 == --m_loopThreadCounter)
+	{
+		std::scoped_lock lock{ m_garbageLock,m_mapLock };
+		for (const auto& [idx, ptr] : m_vecGarbage)
+		{
+			m_mapSessionIter[idx] = nullptr;
+		}
+		m_vecGarbage.clear();
 	}
 }
