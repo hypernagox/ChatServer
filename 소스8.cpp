@@ -29,6 +29,11 @@ static constexpr int MAX_CLIENTS = 5000;
 class IOCPServer;
 class Session;
 
+template <typename ReturnType, typename... Args>
+__forceinline constexpr ReturnType DummyCallBack(Args&&...)noexcept {
+	if constexpr (!std::same_as<ReturnType, void>)return ReturnType{};
+}
+
 class SessionMgr
 {
 private:
@@ -371,7 +376,8 @@ DWORD WINAPI ThreadComplete(LPVOID pParam)
 SessionMgr::SessionMgr()
 	:m_dummyPtr{new Session}
 {
-	m_lookUp[0] = std::mem_fn(&Session::Nothing);
+	//m_lookUp[0] = std::mem_fn(&Session::Nothing);
+	m_lookUp[0] = DummyCallBack<bool, Session*const,Session*const>;
 	m_lookUp[1]	= std::mem_fn(&Session::OnSend);
 	m_vecSession.reserve(MAX_CLIENTS + 1);
 	m_mapSessionIter.reserve(MAX_CLIENTS + 1);
