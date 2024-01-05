@@ -420,7 +420,7 @@ void SessionMgr::AddClientSession(shared_ptr<Session> pSession,int& ID,HANDLE io
 	}
 	else
 	{
-		m_vecSession[id] = tempPtr;
+		m_vecSession.Replace(id, tempPtr);
 	}
 }
 void SessionMgr::RemoveSession(shared_ptr<Session> pSession)

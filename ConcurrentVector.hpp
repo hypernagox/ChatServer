@@ -24,6 +24,12 @@ public:
 		return *temp;
 	}
 
+	template <typename... Args>
+	void Replace(const int idx,Args&&... args)noexcept
+	{
+		std::atomic_ref<T> {data_ptr[idx]}.store(std::forward<Args>(args)...);
+	}
+
 	T& operator[](const unsigned int idx)noexcept { return data_ptr[idx]; }
 	const T& operator[](const unsigned int idx)const noexcept { return data_ptr[idx]; }
 
