@@ -17,7 +17,7 @@
 #include <unordered_set>
 #include <functional>
 #include "ConcurrentVector.hpp"
-
+#include <forward_list>
 using std::list;
 using std::vector;
 using std::shared_ptr;
